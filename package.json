@@ -1,0 +1,10 @@
+{
+  "name": "ground-station",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["shared", "backend", "frontend"],
+  "scripts": {
+    "build": "npm run build -w @ground-station/shared && npm run build -w @ground-station/backend && npm run build -w @ground-station/frontend",
+    "bridge": "npm run start -w @ground-station/backend"
+  }
+}
