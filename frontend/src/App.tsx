@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useXboxBridge, useXboxConfigState } from "./hooks";
 import { ChannelMonitor, Horizon, LogWindow, StatusBar } from "./components/widgets";
 import { Tuning } from "./components/Tuning";
@@ -13,6 +13,18 @@ export default function App() {
   const [cfg, setCfg] = useXboxConfigState();
   const [manualArm, setManualArm] = useState(false);
   const [manualMode, setManualMode] = useState(false);
+  const [manualOn, setManualOn] = useState(false);
+  const [manualThr, setManualThr] = useState(0);
+  const [tabHidden, setTabHidden] = useState(
+    typeof document !== "undefined" ? document.hidden : false,
+  );
+  useEffect(() => {
+    const onVis = () => setTabHidden(document.hidden);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+  const staleMs = status?.inputAgeMs ?? null;
+  const stale = staleMs !== null && staleMs > 500;
   const [level, setLevel] = useState<LogLevel>("info");
   const { padName, padLive, pads, deviceClass, effArm, effMode, effArmAxis, effModeAxis, wsOpen, streaming, padButtons, raw, latchedArm, setLatchedArm, log, status, sendFc, reconnect } = useXboxBridge(
     WS_URL,
@@ -20,6 +32,8 @@ export default function App() {
     run,
     manualArm,
     manualMode,
+    manualOn,
+    manualThr,
   );
 
   const channels = status?.channels ?? new Array(16).fill(992);
@@ -72,6 +86,16 @@ export default function App() {
             <span style={{ fontSize: 12, color: "#bbb" }}>
               {streaming ? "(streamt naar backend)" : wsOpen ? "(verbonden, bridge gestopt)" : "(geen backend-verbinding)"}
             </span>
+            {stale && (
+              <span style={{ fontSize: 12, color: "#e74c3c", fontWeight: "bold" }}>
+                ⚠ INPUT STALE ({staleMs} ms) — laatste stand wordt herhaald, link valt weg bij 5 s
+              </span>
+            )}
+            {tabHidden && run && (
+              <span style={{ fontSize: 12, color: "#f39c12", fontWeight: "bold" }}>
+                ⚠ tab inactief — input loopt op ~1 Hz, houd deze tab in beeld tijdens vliegen/tunen
+              </span>
+            )}
           </h3>
           {(pads ?? []).length > 1 && (
             <div style={{ fontSize: 12, color: "#bbb" }}>
@@ -108,6 +132,23 @@ export default function App() {
           )}
           <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", fontSize: 13 }}>
             <button onClick={() => setRun((v) => !v)}>{run ? "stop bridge" : "start bridge"}</button>
+            <label title="Bench-modus zonder controller: stuurt continu vaste kanalen (sticks midden). Negeert de controller.">
+              <input type="checkbox" checked={manualOn} onChange={(e) => setManualOn(e.target.checked)} /> handmatig
+              (bench)
+            </label>
+            {manualOn && (
+              <label>
+                thr {Math.min(10, manualThr).toFixed(0)}% (max 10)
+                <input
+                  type="range"
+                  min={0}
+                  max={10}
+                  step={0.5}
+                  value={Math.min(10, manualThr)}
+                  onChange={(e) => setManualThr(Number(e.target.value))}
+                />
+              </label>
+            )}
             {deviceClass !== "rc" && (
               <label>
                 throttle-preset{" "}

@@ -300,12 +300,15 @@ export class Bridge {
   }
 
   private tick(): void {
-    // Failsafe: bij HID- of serieel-verlies direct stoppen met zenden
-    // (= failsafe via RX-timeout op de FC).
+    // Failsafe in twee trappen. Geen verse input (tab verborgen, pad weg):
+    // blijf de LAATSTE input sturen zodat de link in leven blijft (net als een
+    // echte zender, die ook nooit stilvalt als je wegkijkt). Pas bij >5s totale
+    // stilte of verbroken WS-verbinding volledig stoppen (= failsafe via RX-timeout).
+    // De UI toont STALE zodra input ouder is dan 500ms.
     if (!this.hidOk) return;
     if (!this.tx?.isOpen) return;
     const age = Date.now() - this.input.receivedAt;
-    if (!this.input.receivedAt || age > 500) return; // geen verse input
+    if (!this.input.receivedAt || age > 5000) return; // geen verse input
 
     const ch = new Array(16).fill(CRSF_MID);
     ch[CH_ROLL] = stickToCrsf(this.input.roll);

@@ -54,6 +54,8 @@ export function useXboxBridge(
   run: boolean,
   manualArm: boolean,
   manualMode: boolean,
+  manualOn: boolean,
+  manualThrPct: number,
 ) {
   const wsRef = useRef<WebSocket | null>(null);
   const pads = useGamepadStatus();
@@ -103,6 +105,7 @@ export function useXboxBridge(
     channels: number[];
     link: LinkStats | null;
     linkAt: number | null;
+    inputAgeMs: number | null;
     attitude: { roll: number; pitch: number; yaw: number };
     fcSupported: boolean;
     ackCount: number;
@@ -148,6 +151,7 @@ export function useXboxBridge(
           ackCount: s?.ackCount ?? 0,
           txUp: msg.txUpBytes,
           txDown: msg.txDownBytes,
+          inputAgeMs: msg.inputAgeMs,
         }));
       } else if (msg.t === "ack") {
         setStatus((s) => (s ? { ...s, fcSupported: true, ackCount: s.ackCount + 1 } : s));
@@ -201,6 +205,16 @@ export function useXboxBridge(
     // (rAF zit vast aan 60/120Hz vsync-judder; dit interval niet.)
     const sender = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN || !run) return;
+      // Handmatige bench-modus: vaste kanaalwaarden, geen controller nodig.
+      // Throttle hard afgetopt op 10% (bench-veiligheid).
+      if (manualOn) {
+        const thr = Math.min(10, Math.max(0, manualThrPct)) / 100;
+        const out = { roll: 0, pitch: 0, throttle: thr, yaw: 0, modeRate: manualMode, armed: manualArm };
+        ws.send(JSON.stringify({ t: "input", ...out }));
+        lastPilotRef.current = out;
+        sentAtRef.current = Date.now();
+        return;
+      }
       const pad = findPad();
       if (!pad) return; // geen pad: niets sturen -> backend-failsafe
       const p = gamepadToPilot(
@@ -272,7 +286,7 @@ export function useXboxBridge(
       ws.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl, run, deviceClass, effArm, effMode, effStart, effBack, effArmAxis, effModeAxis, cfg.preset, cfg.expo, cfg.deadband, manualArm, manualMode]);
+  }, [wsUrl, run, manualOn, manualThrPct, deviceClass, effArm, effMode, effStart, effBack, effArmAxis, effModeAxis, cfg.preset, cfg.expo, cfg.deadband, manualArm, manualMode]);
 
   const send = (obj: unknown) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify(obj));
