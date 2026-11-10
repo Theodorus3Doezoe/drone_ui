@@ -23,8 +23,6 @@ export default function App() {
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
-  const staleMs = status?.inputAgeMs ?? null;
-  const stale = staleMs !== null && staleMs > 500;
   const [level, setLevel] = useState<LogLevel>("info");
   const { padName, padLive, pads, deviceClass, effArm, effMode, effArmAxis, effModeAxis, wsOpen, streaming, padButtons, raw, latchedArm, setLatchedArm, log, status, sendFc, reconnect } = useXboxBridge(
     WS_URL,
@@ -35,8 +33,9 @@ export default function App() {
     manualOn,
     manualThr,
   );
-
   const channels = status?.channels ?? new Array(16).fill(992);
+  const staleMs = status?.inputAgeMs ?? null;
+  const stale = staleMs !== null && staleMs > 500;
   const armed = (channels[8] ?? 992) > 1500;
   const rate = (channels[4] ?? 992) > 1500;
   const linked = !!status?.link;
