@@ -22,10 +22,13 @@ import {
 } from "@ground-station/shared";
 import { SerialPort } from "serialport";
 import { WebSocketServer, WebSocket } from "ws";
+import { resolveFcPort, resolveTxPort } from "./detect.js";
 
 export interface BridgeOptions {
   txPort: string;
   fcPort: string;
+  txReq: string;
+  fcReq: string;
   txBaud: number;
   fcBaud: number;
   wsPort: number;
@@ -86,6 +89,13 @@ export class Bridge {
   private logListeners = new Set<(msg: BackendToPc) => void>();
   private bannerSent = { tx: false, fc: false, hid: false };
   private loop: NodeJS.Timeout | null = null;
+  private watch: NodeJS.Timeout | null = null;
+  private txOpening = false;
+  private fcOpening = false;
+  private lastTxAttempt = 0;
+  private lastFcAttempt = 0;
+  private lastTxWarn = 0;
+  private lastFcWarn = 0;
 
   constructor(private opts: BridgeOptions) {}
 
@@ -113,8 +123,8 @@ export class Bridge {
   statusMessage(): BackendToPc {
     return {
       t: "status",
-      tx: { name: this.opts.txPort, baud: this.opts.txBaud, open: this.tx?.isOpen ?? false, error: this.txError },
-      fc: { name: this.opts.fcPort, baud: this.opts.fcBaud, open: this.fc?.isOpen ?? false, error: this.fcError },
+      tx: { name: this.tx?.path ?? this.opts.txPort, baud: this.opts.txBaud, open: this.tx?.isOpen ?? false, error: this.txError },
+      fc: { name: this.fc?.path ?? this.opts.fcPort, baud: this.opts.fcBaud, open: this.fc?.isOpen ?? false, error: this.fcError },
       bridgeHz: this.bridgeHz,
       inputAgeMs: this.input.receivedAt ? Date.now() - this.input.receivedAt : null,
       corruptFrames: this.corruptFrames,
@@ -125,8 +135,21 @@ export class Bridge {
   }
 
   async start(): Promise<void> {
-    this.openTx();
-    this.openFc();
+    void this.openTx();
+    void this.openFc();
+    // Watcher: apparaat (her)verschijnt of verdwijnt -> automatisch (her)openen.
+    // Her-detecteert "auto"-poorten bij elke poging; hooguit 1 poging per 3s,
+    // waarschuwing hooguit 1x per 30s (geen logspam).
+    this.watch = setInterval(() => {
+      const now = Date.now();
+      if (this.txReqOn() && (!this.tx || !this.tx.isOpen) && now - this.lastTxAttempt > 3000) {
+        void this.openTx();
+      }
+      if (this.fcReqOn() && (!this.fc || !this.fc.isOpen) && now - this.lastFcAttempt > 3000) {
+        void this.openFc();
+      }
+    }, 2500);
+    this.watch.unref?.();
     const periodMs = 1000 / (this.opts.bridgeHz ?? 150);
     let lastHzCount = 0;
     let lastHzAt = Date.now();
@@ -172,10 +195,20 @@ export class Bridge {
   async stop(): Promise<void> {
     if (this.loop) clearTimeout(this.loop);
     this.loop = null;
+    if (this.watch) clearInterval(this.watch);
+    this.watch = null;
     await this.closePort(this.tx);
     await this.closePort(this.fc);
     this.tx = null;
     this.fc = null;
+  }
+
+  private txReqOn(): boolean {
+    return this.opts.txReq !== "off" && this.opts.txReq !== "none";
+  }
+
+  private fcReqOn(): boolean {
+    return this.opts.fcReq !== "off" && this.opts.fcReq !== "none";
   }
 
   private closePort(p: SerialPort | null): Promise<void> {
@@ -186,12 +219,16 @@ export class Bridge {
   }
 
   reconnect(port: "tx" | "fc"): void {
+    // Forceer een verse detectie (geen throttle): pakt het juiste apparaat,
+    // ook als poorten zijn verschoven sinds de start.
     if (port === "tx") {
       this.bannerSent.tx = false;
-      this.openTx();
+      this.lastTxAttempt = 0;
+      void this.openTx();
     } else {
       this.bannerSent.fc = false;
-      this.openFc();
+      this.lastFcAttempt = 0;
+      void this.openFc();
     }
   }
 
@@ -286,9 +323,16 @@ export class Bridge {
     this.lastFrameAt = Date.now();
   }
 
-  private openTx(): void {
-    this.closePort(this.tx).finally(() => {
-      const port = new SerialPort({ path: this.opts.txPort, baudRate: this.opts.txBaud, autoOpen: false });
+  private async openTx(): Promise<void> {
+    if (this.txOpening || !this.txReqOn()) return;
+    this.txOpening = true;
+    this.lastTxAttempt = Date.now();
+    try {
+      const path = await resolveTxPort(this.opts.txReq, true);
+      if (!path) return; // stil: watcher probeert opnieuw
+      await this.closePort(this.tx);
+      if (this.tx?.isOpen) return; // intussen al open (race met watcher)
+      const port = new SerialPort({ path, baudRate: this.opts.txBaud, autoOpen: false });
       this.tx = port;
       this.txError = undefined;
       port.on("data", (d: Buffer) => this.onTxData(new Uint8Array(d)));
@@ -304,18 +348,42 @@ export class Bridge {
         if (err) {
           this.txError = err.message;
           this.onPortLost("tx", err.message);
+          this.warnThrottled("tx", `TX ${path} niet te openen (${err.message}) — blijf proberen`);
         } else {
           this.txError = undefined;
-          this.log("info", `TX-poort open: ${this.opts.txPort} @ ${this.opts.txBaud}`);
+          this.bannerSent.tx = false;
+          this.log("info", `TX-poort open: ${path} @ ${this.opts.txBaud}`);
           this.broadcast(this.statusMessage());
         }
       });
-    });
+    } finally {
+      this.txOpening = false;
+    }
   }
 
-  private openFc(): void {
-    this.closePort(this.fc).finally(() => {
-      const port = new SerialPort({ path: this.opts.fcPort, baudRate: this.opts.fcBaud, autoOpen: false });
+  /** Waarschuwing hooguit 1x per 30s (geen logspam bij afwezige hardware). */
+  private warnThrottled(port: "tx" | "fc", message: string): void {
+    const now = Date.now();
+    if (port === "tx") {
+      if (now - this.lastTxWarn < 30000) return;
+      this.lastTxWarn = now;
+    } else {
+      if (now - this.lastFcWarn < 30000) return;
+      this.lastFcWarn = now;
+    }
+    this.log("warn", message);
+  }
+
+  private async openFc(): Promise<void> {
+    if (this.fcOpening || !this.fcReqOn()) return;
+    this.fcOpening = true;
+    this.lastFcAttempt = Date.now();
+    try {
+      const path = await resolveFcPort(this.opts.fcReq, true);
+      if (!path) return; // stil: watcher probeert opnieuw
+      await this.closePort(this.fc);
+      if (this.fc?.isOpen) return;
+      const port = new SerialPort({ path, baudRate: this.opts.fcBaud, autoOpen: false });
       this.fc = port;
       this.fcError = undefined;
       port.on("data", (d: Buffer) => this.onFcData(new Uint8Array(d)));
@@ -331,13 +399,17 @@ export class Bridge {
         if (err) {
           this.fcError = err.message;
           this.onPortLost("fc", err.message);
+          this.warnThrottled("fc", `FC ${path} niet te openen (${err.message}) — blijf proberen`);
         } else {
           this.fcError = undefined;
-          this.log("info", `FC-poort open: ${this.opts.fcPort} @ ${this.opts.fcBaud}`);
+          this.bannerSent.fc = false;
+          this.log("info", `FC-poort open: ${path} @ ${this.opts.fcBaud}`);
           this.broadcast(this.statusMessage());
         }
       });
-    });
+    } finally {
+      this.fcOpening = false;
+    }
   }
 
   private onPortLost(port: "tx" | "fc", message: string): void {

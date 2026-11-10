@@ -22,6 +22,8 @@ function hasFlag(name: string): boolean {
 const cli = {
   txPort: arg("--tx-port", process.env.TX_PORT ?? "auto"),
   fcPort: arg("--fc-port", process.env.FC_PORT ?? "auto"),
+  txReq: arg("--tx-port", process.env.TX_PORT ?? "auto"),
+  fcReq: arg("--fc-port", process.env.FC_PORT ?? "auto"),
   txBaud: argNum("--tx-baud", Number(process.env.TX_BAUD ?? 921600)),
   fcBaud: argNum("--fc-baud", Number(process.env.FC_BAUD ?? 115200)),
   wsPort: argNum("--ws-port", Number(process.env.WS_PORT ?? 8080)),

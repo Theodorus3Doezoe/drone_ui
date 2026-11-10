@@ -25,14 +25,22 @@ ch9=arm (SE, >1500=armed). Overig op midden (992). Waarden 172–1811.
 ## Draaien
 
 ```bash
-npm install
-npm run build
-npm run bridge            # auto-detecteert TX (CP210x/CH340) en FC (RP2350)
+npm install          # eenmalig
+npm run dev          # bouwt shared+backend, start bridge én dashboard, opent de browser
+# extra bridge-opties: npm run dev -- --tx-port /dev/ttyUSB0 --fc-port /dev/ttyACM0
+# zonder browser:      npm run dev -- --no-open
+```
+
+Losse onderdelen (indien nodig):
+
+```bash
+npm run build         # alles compileren
+npm run bridge        # alleen backend (auto-detecteert TX (CP210x/CH340) en FC (RP2350))
 # expliciet mag altijd: --tx-port /dev/ttyUSB0 --fc-port /dev/ttyACM0
 # overig: --tx-baud 420000 --fc-baud 115200 --ws-port 8080
 # bekijk kandidaten: npm run bridge -- --list-ports
 # Headless HID-joystick: --hid (auto) of --hid=/dev/hidraw0 (Xbox via frontend!)
-cd frontend && npm run dev   # UI optioneel, verbindt op ws://<host>:8080
+cd frontend && npm run dev   # UI los, verbindt op ws://<host>:8080
 ```
 
 ## Xbox-controller

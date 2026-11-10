@@ -5,6 +5,7 @@
 //   (10c4:ea60) of CH340 (1a86:7523), soms FTDI (0403:6001). Zwakkere heuristiek:
 //   een sterk FC-gematchte poort wordt nooit als TX gekozen.
 import { SerialPort } from "serialport";
+import { CRSF_MID, encodeRcChannels, parseCrsfStream } from "@ground-station/shared";
 
 export interface DetectedPort {
   path: string;
@@ -69,20 +70,103 @@ export async function detectPorts(): Promise<{ tx: DetectedPort | null; fc: Dete
   return pickPorts(list.filter((p) => p.path));
 }
 
-/** "auto" (of leeg) -> detectie; expliciete waarde wint altijd. */
+/** "auto" (of leeg) -> detectie; "off"/"none" -> uit; rest is letterlijk pad. */
+export async function resolveTxPort(req: string, quiet = false): Promise<string> {
+  if (req === "off" || req === "none") return "";
+  if (req && req !== "auto") return req;
+  const found = await pickTxPort().catch(() => null);
+  if (found) {
+    if (!quiet) console.log(`TX auto: ${found.path} (${found.reason})`);
+    return found.path;
+  }
+  if (!quiet) console.log("TX niet gevonden — probeer opnieuw zodra een apparaat verschijnt (of geef --tx-port mee)");
+  return "";
+}
+
+/** Zelfde voor FC, maar zónder zwakke heuristiek: nooit zomaar een ACM-poort pakken. */
+export async function resolveFcPort(req: string, quiet = false): Promise<string> {
+  if (req === "off" || req === "none") return "";
+  if (req && req !== "auto") return req;
+  const { fc } = await detectPorts().catch(() => ({ tx: null, fc: null as null }));
+  if (fc?.path) {
+    if (!quiet) console.log(`FC auto: ${fc.path} (${fc.reason})`);
+    return fc.path;
+  }
+  if (!quiet) console.log("FC niet gevonden — sla over tot hij verschijnt (of geef --fc-port mee)");
+  return "";
+}
+
+/** Open kandidaat op 921600, stuur neutrale RC-frames, check op 0x3A-sync (alleen een TX doet dat). */
+async function probeTxCandidate(path: string): Promise<boolean> {
+  const port = new SerialPort({ path, baudRate: 921600, autoOpen: false });
+  try {
+    await Promise.race([
+      port.open(),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("open-timeout")), 2000)),
+    ]);
+  } catch {
+    return false;
+  }
+  let found = false;
+  let rest: Uint8Array = new Uint8Array(0);
+  const frame = Buffer.from(encodeRcChannels(new Array(16).fill(CRSF_MID)));
+  port.on("data", (d: Buffer) => {
+    const bytes = new Uint8Array(d.length);
+    bytes.set(d);
+    const buf = new Uint8Array(rest.length + bytes.length);
+    buf.set(rest, 0);
+    buf.set(bytes, rest.length);
+    try {
+      const r = parseCrsfStream(buf);
+      rest = r.rest;
+      if (r.frames.some((f) => f.type === 0x3a)) found = true;
+    } catch {
+      rest = new Uint8Array(0);
+    }
+  });
+  try {
+    for (let i = 0; i < 8 && !found; i++) {
+      await port.write(frame);
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    if (!found) await new Promise((r) => setTimeout(r, 300));
+  } catch {
+    /* genegeerd — kandidaat telt niet mee */
+  }
+  try {
+    await port.close();
+  } catch {
+    /* al dicht */
+  }
+  return found;
+}
+
+/** Kies TX-poort: bij meerdere CP210x-kandidaten proben welke echt een TX is. */
+export async function pickTxPort(): Promise<DetectedPort | null> {
+  let list: Info[] = [];
+  try {
+    list = ((await SerialPort.list()) as Info[]).filter((p) => p.path);
+  } catch {
+    return null;
+  }
+  const scored = list
+    .map((p) => ({ p, s: txScore(p) }))
+    .filter((x): x is { p: Info; s: NonNullable<ReturnType<typeof txScore>> } => x.s !== null)
+    .sort((a, b) => b.s.score - a.s.score);
+  if (scored.length === 0) return null;
+  if (scored.length === 1) return { path: scored[0].p.path!, reason: `${scored[0].s.reason} (enige kandidaat)` };
+  for (const { p } of scored) {
+    console.log(`TX-probe ${p.path}: 0x16 sturen, wachten op 0x3A-sync...`);
+    if (await probeTxCandidate(p.path!)) return { path: p.path!, reason: "USB-UART + antwoordt op CRSF" };
+  }
+  return { path: scored[0].p.path!, reason: `${scored[0].s.reason} (geen antwoord, toch proberen)` };
+}
+
+/** "auto" (of leeg) -> detectie; expliciete waarde wint altijd; "off" -> leeg. */
 export async function resolvePorts(
   txReq: string,
   fcReq: string,
-  txFallback = "/dev/ttyUSB0",
-  fcFallback = "/dev/ttyACM0",
 ): Promise<{ txPort: string; fcPort: string }> {
-  const needDetect = txReq === "auto" || fcReq === "auto" || !txReq || !fcReq;
-  const detected = needDetect ? await detectPorts().catch(() => ({ tx: null, fc: null })) : { tx: null, fc: null };
-  let txPort = txReq && txReq !== "auto" ? txReq : (detected.tx?.path ?? txFallback);
-  let fcPort = fcReq && fcReq !== "auto" ? fcReq : (detected.fc?.path ?? fcFallback);
-  if ((!txReq || txReq === "auto") && detected.tx) console.log(`TX auto-detect: ${detected.tx.path} (${detected.tx.reason})`);
-  else if (!txReq || txReq === "auto") console.warn(`TX niet gevonden, fallback ${txPort} (geef --tx-port mee)`);
-  if ((!fcReq || fcReq === "auto") && detected.fc) console.log(`FC auto-detect: ${detected.fc.path} (${detected.fc.reason})`);
-  else if (!fcReq || fcReq === "auto") console.warn(`FC niet gevonden, fallback ${fcPort} (geef --fc-port mee)`);
+  const [txPort, fcPort] = await Promise.all([resolveTxPort(txReq), resolveFcPort(fcReq)]);
   return { txPort, fcPort };
 }
