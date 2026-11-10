@@ -15,6 +15,8 @@ export default function App() {
   const [manualMode, setManualMode] = useState(false);
   const [manualOn, setManualOn] = useState(false);
   const [manualThr, setManualThr] = useState(0);
+  const [thrStep, setThrStep] = useState<1 | 0.5 | 0.2>(1);
+  const bumpThr = (d: number) => setManualThr((v) => Math.min(10, Math.max(0, Math.round((v + d) * 10) / 10)));
   const [tabHidden, setTabHidden] = useState(
     typeof document !== "undefined" ? document.hidden : false,
   );
@@ -136,17 +138,28 @@ export default function App() {
               (bench)
             </label>
             {manualOn && (
-              <label>
-                thr {Math.min(10, manualThr).toFixed(0)}% (max 10)
-                <input
-                  type="range"
-                  min={0}
-                  max={10}
-                  step={0.5}
-                  value={Math.min(10, manualThr)}
-                  onChange={(e) => setManualThr(Number(e.target.value))}
-                />
-              </label>
+              <>
+                <label>
+                  thr {Math.min(10, manualThr).toFixed(1)}% (max 10)
+                  <input
+                    type="range"
+                    min={0}
+                    max={10}
+                    step={0.1}
+                    value={Math.min(10, manualThr)}
+                    onChange={(e) => setManualThr(Number(e.target.value))}
+                  />
+                </label>
+                <span>
+                  <button onClick={() => bumpThr(-thrStep)} title={`-${thrStep}%`}>−</button>
+                  <button onClick={() => bumpThr(thrStep)} title={`+${thrStep}%`}>+</button>
+                  <select value={thrStep} onChange={(e) => setThrStep(Number(e.target.value) as 1 | 0.5 | 0.2)} title="stapgrootte">
+                    <option value={1}>1.0</option>
+                    <option value={0.5}>0.5</option>
+                    <option value={0.2}>0.2</option>
+                  </select>
+                </span>
+              </>
             )}
             {deviceClass !== "rc" && (
               <label>

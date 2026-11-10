@@ -82,6 +82,10 @@ export function useXboxBridge(
   const prevStartRef = useRef(false);
   const prevArmBtnRef = useRef(false);
   const prevModeBtnRef = useRef(false);
+  // Live-waarden via ref i.p.v. effect-deps: sliders (throttle, expo) mogen
+  // NOOIT de WebSocket/sender opnieuw opbouwen mid-stream.
+  const inputCfg = useRef({ run, manualOn, manualThr: manualThrPct, manualArm, manualMode, cfg, deviceClass, effArm, effMode, effStart, effBack, effArmAxis, effModeAxis });
+  inputCfg.current = { run, manualOn, manualThr: manualThrPct, manualArm, manualMode, cfg, deviceClass, effArm, effMode, effStart, effBack, effArmAxis, effModeAxis };
   const lastPilotRef = useRef<{
     roll: number;
     pitch: number;
@@ -204,12 +208,13 @@ export function useXboxBridge(
     // Vaste 100Hz-zender, los van display-vsync: stabiele cadans richting backend.
     // (rAF zit vast aan 60/120Hz vsync-judder; dit interval niet.)
     const sender = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN || !run) return;
-      // Handmatige bench-modus: vaste kanaalwaarden, geen controller nodig.
+      const ic = inputCfg.current;
+      if (ws.readyState !== WebSocket.OPEN || !ic.run) return;
+      // Handmatige bench-modus: vaste kanalen, geen controller nodig.
       // Throttle hard afgetopt op 10% (bench-veiligheid).
-      if (manualOn) {
-        const thr = Math.min(10, Math.max(0, manualThrPct)) / 100;
-        const out = { roll: 0, pitch: 0, throttle: thr, yaw: 0, modeRate: manualMode, armed: manualArm };
+      if (ic.manualOn) {
+        const thr = Math.min(10, Math.max(0, ic.manualThr)) / 100;
+        const out = { roll: 0, pitch: 0, throttle: thr, yaw: 0, modeRate: ic.manualMode, armed: ic.manualArm };
         ws.send(JSON.stringify({ t: "input", ...out }));
         lastPilotRef.current = out;
         sentAtRef.current = Date.now();
@@ -219,16 +224,16 @@ export function useXboxBridge(
       if (!pad) return; // geen pad: niets sturen -> backend-failsafe
       const p = gamepadToPilot(
         pad,
-        cfg,
-        { arm: effArm, mode: effMode, start: effStart, back: effBack, armAxis: effArmAxis, modeAxis: effModeAxis },
-        deviceClass,
+        ic.cfg,
+        { arm: ic.effArm, mode: ic.effMode, start: ic.effStart, back: ic.effBack, armAxis: ic.effArmAxis, modeAxis: ic.effModeAxis },
+        ic.deviceClass,
       );
       let armed: boolean;
       let modeRate: boolean;
-      if (deviceClass === "rc") {
+      if (ic.deviceClass === "rc") {
         // Houd-schakelaars (CH5/CH9): direct niveau, géén flank-toggle.
-        armed = p.armedHold || manualArm;
-        modeRate = p.modeRate || manualMode;
+        armed = p.armedHold || ic.manualArm;
+        modeRate = p.modeRate || ic.manualMode;
       } else {
         // Knoppen: stijgende flank flipt de vergrendeling — geen hold-gedrag meer,
         // ongeacht welke knop erop gemapt is. Start/Back blijven absolute aan/uit.
@@ -246,8 +251,8 @@ export function useXboxBridge(
           push("info", v ? "mode RATE (toggle)" : "mode ANGLE (toggle)");
         }
         prevModeBtnRef.current = p.modeRate;
-        armed = latchRef.current || manualArm;
-        modeRate = modeLatchRef.current || manualMode;
+        armed = latchRef.current || ic.manualArm;
+        modeRate = modeLatchRef.current || ic.manualMode;
       }
       if (p.startPressed && !prevStartRef.current) {
         latchRef.current = true;
@@ -286,7 +291,7 @@ export function useXboxBridge(
       ws.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl, run, manualOn, manualThrPct, deviceClass, effArm, effMode, effStart, effBack, effArmAxis, effModeAxis, cfg.preset, cfg.expo, cfg.deadband, manualArm, manualMode]);
+  }, [wsUrl]);
 
   const send = (obj: unknown) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify(obj));
