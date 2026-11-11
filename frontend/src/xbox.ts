@@ -47,7 +47,7 @@ export interface ButtonMap {
 }
 
 /** -1 = niet gemapt. */
-export const XBOX_BUTTONS: ButtonMap = { arm: 5, mode: 4, start: 9, back: 8, armAxis: -1, modeAxis: -1 };
+export const XBOX_BUTTONS: ButtonMap = { arm: 4, mode: 5, start: 9, back: 8, armAxis: -1, modeAxis: -1 };
 /** RC-klasse (EdgeTX-model van Sven): CH5 = mode op as 4, CH9 = arm op as 8. */
 export const RC_BUTTONS: ButtonMap = { arm: -1, mode: -1, start: -1, back: -1, armAxis: 8, modeAxis: 4 };
 
@@ -136,8 +136,8 @@ export const XBOX_LEGEND: [string, string][] = [
   ["Linker stick", "mode2: yaw + throttle / triggers: roll + pitch"],
   ["Rechter stick", "mode2: roll + pitch / triggers: yaw (X)"],
   ["RT / LT", "triggers-preset: throttle (verschil RT−LT)"],
-  ["RB", "arm TOGGLE (indrukken = om)"],
-  ["LB", "mode TOGGLE (Angle ↔ Rate)"],
+  ["LB", "arm TOGGLE (indrukken = om)"],
+  ["RB", "mode TOGGLE (Angle ↔ Rate)"],
   ["Start", "arm AAN (absoluut)"],
   ["Back", "arm UIT (absoluut, paniekknop)"],
 ];

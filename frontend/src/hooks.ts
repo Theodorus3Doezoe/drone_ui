@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { BackendToPc, FromPc, LinkStats, LogLevel, PortState } from "@ground-station/shared";
+import type { BackendToPc, FromPc, LinkStats, LogLevel, PortState, RxSight, TunAck } from "@ground-station/shared";
 import {
   CH_ARM,
   CH_MODE,
@@ -101,6 +101,15 @@ export function useXboxBridge(
     setLatchedArmState(v);
   };
   const [log, setLog] = useState<{ level: LogLevel; message: string; at: string }[]>([]);
+  const [rx, setRx] = useState<RxSight[]>([]);
+  const [toasts, setToasts] = useState<{ id: number; message: string }[]>([]);
+  const toastId = useRef(0);
+  // Verbindingsstatus richting backend: "connecting" bij opstarten/retry,
+  // "open" bij live-verbinding, "down" bij verlies (met auto-retry + banner).
+  const [connState, setConnState] = useState<"connecting" | "open" | "down">("connecting");
+  const [attempt, setAttempt] = useState(0);
+  const connRef = useRef(connState);
+  connRef.current = connState;
   const [status, setStatus] = useState<{
     tx: PortState;
     fc: PortState;
@@ -113,6 +122,9 @@ export function useXboxBridge(
     attitude: { roll: number; pitch: number; yaw: number };
     fcSupported: boolean;
     ackCount: number;
+    lastTunack: TunAck | null;
+    lastPingMs: number | null;
+    lastPingAt: number | null;
     txUp: number;
     txDown: number;
   } | null>(null);
@@ -121,18 +133,43 @@ export function useXboxBridge(
   const lastRawRef = useRef(0);
 
   useEffect(() => {
+    // alive-bewaker: een opgeruimde instantie (StrictMode-dubbelmount, retry)
+    // mag nooit de opvolger sluiten of een nieuwe poging plannen — dat gaf
+    // een zelfinstandhoudende 3s verbindingsflap.
+    let alive = true;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
     let raf = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     const push = (level: LogLevel, message: string) =>
       setLog((l) => [...l.slice(-299), { level, message, at: new Date().toLocaleTimeString() }]);
+    const toast = (message: string) => {
+      const id = ++toastId.current;
+      setToasts((t) => [...t.slice(-2), { id, message }]);
+    };
     ws.onopen = () => {
+      if (!alive) {
+        ws.close();
+        return;
+      }
       setWsOpen(true);
-      push("info", `verbonden met backend (${wsUrl})`);
+      if (connRef.current !== "open") {
+        setConnState("open");
+        push("info", attempt > 0 ? `backend-verbinding hersteld (${wsUrl})` : `verbonden met backend (${wsUrl})`);
+      }
     };
     ws.onclose = () => {
+      if (!alive) return;
       setWsOpen(false);
-      push("error", "backend-verbinding weg");
+      // Alleen bij de overgang open/connecting -> down loggen (geen spam per retry).
+      if (connRef.current !== "down") {
+        setConnState("down");
+        push("error", `backend-verbinding weg (${wsUrl}) — probeer automatisch opnieuw`);
+        toast(`Backend-verbinding weg (${wsUrl})`);
+      }
+      retryTimer = setTimeout(() => {
+        if (alive) setAttempt((a) => a + 1);
+      }, 3000);
     };
     ws.onmessage = (ev) => {
       let msg: BackendToPc;
@@ -153,6 +190,9 @@ export function useXboxBridge(
           attitude: s?.attitude ?? { roll: 0, pitch: 0, yaw: 0 },
           fcSupported: msg.fcSupported || (s?.fcSupported ?? false),
           ackCount: s?.ackCount ?? 0,
+          lastTunack: s?.lastTunack ?? null,
+          lastPingMs: s?.lastPingMs ?? null,
+          lastPingAt: s?.lastPingAt ?? null,
           txUp: msg.txUpBytes,
           txDown: msg.txDownBytes,
           inputAgeMs: msg.inputAgeMs,
@@ -160,6 +200,20 @@ export function useXboxBridge(
       } else if (msg.t === "ack") {
         setStatus((s) => (s ? { ...s, fcSupported: true, ackCount: s.ackCount + 1 } : s));
         push("info", "FC Ack ontvangen — tuning live");
+      } else if (msg.t === "tunack") {
+        const a = msg.ack;
+        const detail =
+          a.kind === "pid"
+            ? `Pid as${a.axis} kp=${a.kp} ki=${a.ki} kd=${a.kd} ${a.ok ? "ok" : "MISLUKT"}`
+            : `Filter gyro=${a.gyro} lpf1=${a.lpf1} lpf2=${a.lpf2} ${a.ok ? "ok" : "MISLUKT"}`;
+        setStatus((s) => (s ? { ...s, fcSupported: true, ackCount: s.ackCount + 1, lastTunack: a } : s));
+        push(a.ok ? "info" : "error", `FC TunAck (0x7F04): ${detail}`);
+      } else if (msg.t === "ping") {
+        const hex = msg.bytes.map((b) => b.toString(16).padStart(2, "0")).join(" ");
+        if (msg.rttMs !== null) {
+          setStatus((s) => (s ? { ...s, lastPingMs: msg.rttMs, lastPingAt: Date.now() } : s));
+        }
+        push("debug", `ping-echo (0x7F03) seq=${msg.seq}${msg.rttMs !== null ? ` RTT ${msg.rttMs}ms` : " (geen match)"} ${msg.bytes.length}B: ${hex}`);
       } else if (msg.t === "channels") {
         // Genegeerd: de monitor komt uit lokaal verstuurde input (nul latentie).
         // De backend-echo blijft bestaan voor andere consumers.
@@ -170,6 +224,10 @@ export function useXboxBridge(
         setStatus((s) => (s ? { ...s, attitude: { roll: msg.roll, pitch: msg.pitch, yaw: msg.yaw } } : s));
       } else if (msg.t === "banner" || msg.t === "log") {
         push(msg.t === "banner" ? "error" : msg.level, msg.t === "banner" ? `[${msg.port}] ${msg.message}` : msg.message);
+        if (msg.t === "banner") toast(`[${msg.port}] ${msg.message}`);
+      } else if (msg.t === "rx") {
+        const sight = msg.sight;
+        setRx((r) => [...r.slice(-199), sight]);
       }
     };
     const loop = () => {
@@ -285,21 +343,36 @@ export function useXboxBridge(
       }
     }, 1000);
     return () => {
+      alive = false;
       cancelAnimationFrame(raf);
       clearInterval(sender);
       clearInterval(linkWatch);
+      if (retryTimer) clearTimeout(retryTimer);
       ws.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl]);
+  }, [wsUrl, attempt]);
 
   const send = (obj: unknown) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify(obj));
   };
   const sendFc = (cmd: FromPc) => send({ t: "fc", cmd });
+  const sendTune = (cmd: FromPc) => send({ t: "tune", cmd });
   const reconnect = (port: "tx" | "fc") => send({ t: "reconnect", port });
+  const setTxBaud = (baud: number) => send({ t: "setTxBaud", baud });
+  const clearRx = () => setRx([]);
+  /** Handmatige reconnect: verbreek en start een verse poging. */
+  const retryNow = () => {
+    try {
+      wsRef.current?.close();
+    } catch {
+      /* genegeerd — onclose plant de retry */
+    }
+    setAttempt((a) => a + 1);
+  };
+  const dismissToast = (id: number) => setToasts((t) => t.filter((x) => x.id !== id));
 
-  return { padName, padLive, pads, deviceClass, effArm, effMode, effArmAxis, effModeAxis, wsOpen, streaming, padButtons, raw, latchedArm, setLatchedArm, latchedMode, log, status, wsUrl, sendFc, reconnect };
+  return { padName, padLive, pads, deviceClass, effArm, effMode, effArmAxis, effModeAxis, wsOpen, connState, retryCount: attempt, retryNow, streaming, padButtons, raw, latchedArm, setLatchedArm, latchedMode, log, toasts, dismissToast, rx, clearRx, status, wsUrl, sendFc, sendTune, setTxBaud, reconnect };
 }
 
 export function useXboxConfigState(): [XboxConfig, (p: Partial<XboxConfig>) => void] {

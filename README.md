@@ -38,6 +38,8 @@ npm run build         # alles compileren
 npm run bridge        # alleen backend (auto-detecteert TX (CP210x/CH340) en FC (RP2350))
 # expliciet mag altijd: --tx-port /dev/ttyUSB0 --fc-port /dev/ttyACM0
 # overig: --tx-baud 420000 --fc-baud 115200 --ws-port 8080
+# TX-baud staat standaard op 921600 en is live om te zetten in het dashboard
+# (presets 921600/420000 of een eigen waarde; de poort heropent automatisch).
 # bekijk kandidaten: npm run bridge -- --list-ports
 # Headless HID-joystick: --hid (auto) of --hid=/dev/hidraw0 (Xbox via frontend!)
 cd frontend && npm run dev   # UI los, verbindt op ws://<host>:8080
@@ -53,9 +55,13 @@ cd frontend && npm run dev   # UI los, verbindt op ws://<host>:8080
   EdgeTX-conventie) of **Triggers** (RT−LT = throttle). Expo- en
   deadband-schuiven, live knopweergave (A/B/X/Y, LB/RB, LT/RT, Back/Start) en een
   knop-legenda zijn ingebouwd.
-- Veiligheid: **RB vasthouden = armed** (loslaten = disarm), Start = arm-latch,
-  Back = latch uit, LB = Rate-mode. Zonder pad stuurt de UI niets en grijpt de
+- Veiligheid: **LB indrukken = arm-toggle**, Start = arm-latch,
+  Back = latch uit, RB = Rate-mode-toggle. Zonder pad stuurt de UI niets en grijpt de
   backend-failsafe in (geen verse input → stop met zenden).
+- **ELRS-heartbeat:** zodra de TX-poort open is stuurt de backend 1× per seconde
+  een ping (`0x7A`/`0x7F03`, seq+tijd+random) via de TX-module; de FC echoot via
+  `0x7B`/`0x7F03` en het dashboard toont de RTT. TunAck (`0x7B`/`0x7F04`,
+  postcard) markeert tuning live en toont de toegepaste waarden.
 - **Headless** (`--hid`): voor echte USB-HID-joysticks (Boxer e.d.); XInput-rapporten
   (xpad-driver) worden herkend, anders generieke 8-bit HID-assen.
 

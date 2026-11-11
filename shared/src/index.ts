@@ -7,6 +7,25 @@ export const CRSF_MID = 992;
 export const CRSF_MAX = 1811;
 export const CRSF_SPAN = CRSF_MAX - CRSF_MID; // 819
 export const CRSF_ADDR = 0xc8;
+/** CRSF-sync/adreswaarden die als framestart mogen voorkomen. */
+export const CRSF_ADDR_RADIO = 0xea; // handset/radio transmitter
+export const CRSF_ADDR_RX = 0xec; // receiver
+export const CRSF_ADDR_TX = 0xee; // TX-module
+export const CRSF_ADDR_BROADCAST = 0x00;
+
+const CRSF_SYNC_ADDRESSES = new Set([CRSF_ADDR, CRSF_ADDR_RADIO, CRSF_ADDR_RX, CRSF_ADDR_TX]);
+const CRSF_DEVICE_ADDRESSES = new Set([...CRSF_SYNC_ADDRESSES, CRSF_ADDR_BROADCAST]);
+
+/** True als `b` een CRSF-syncadres is waarmee een frame mag beginnen. */
+export function isCrsfSyncAddress(b: number): boolean {
+  return CRSF_SYNC_ADDRESSES.has(b);
+}
+
+/** True als `b` een bekend CRSF-apparaatadres is (incl. broadcast). */
+function isCrsfDeviceAddress(b: number): boolean {
+  return CRSF_DEVICE_ADDRESSES.has(b);
+}
+
 export const CRSF_TYPE_RC_CHANNELS = 0x16;
 export const CRSF_TYPE_LINK_STATS = 0x14;
 export const CRSF_FRAME_LEN = 26; // addr+len+type+22B+crc
@@ -104,23 +123,48 @@ export interface CrsfParseResult {
   /** Resterende onvolledige bytes (opnieuw aanbieden bij volgende read). */
   rest: Uint8Array;
   corrupt: number;
+  /** Afgekeurde kandidaten (max 8 per call) — voor diagnose, met byte-snippet. */
+  bad: CrsfReject[];
 }
 
-/** Incrementele parser: valideer len + CRC, drop corrupte frames met teller. */
+/** Afgekeurd CRSF-frame: reden + snippet van de ruwe bytes (max 16B). */
+export interface CrsfReject {
+  reason: "bad-len" | "bad-crc";
+  type?: number;
+  len?: number;
+  bytes: number[];
+}
+
+/** Incrementele parser: valideer len + CRC, drop corrupte frames met teller.
+ *  Afgekeurde kandidaten komen (gecapt) in `bad` terecht i.p.v. stil te verdwijnen. */
 export function parseCrsfStream(buf: Uint8Array): CrsfParseResult {
   const frames: CrsfFrame[] = [];
+  const bad: CrsfReject[] = [];
+  const reject = (r: CrsfReject) => {
+    if (bad.length < 8) bad.push(r);
+  };
+  const snippet = (from: number, n: number): number[] => [...buf.slice(from, Math.min(buf.length, from + n))];
   let corrupt = 0;
   let i = 0;
   while (i < buf.length) {
-    if (buf[i] !== CRSF_ADDR) {
+    // Sommige ELRS/firmware-varianten sturen een extra 0xC8-sync vóór het
+    // eigenlijke frame (bv. "C8 EA 0D 3A ..."). Een echt frame met adres 0xC8
+    // kan nooit een lengte 0xEA/0xEC/0xEE hebben (max 62), dus zo'n byte is
+    // veilig als extra sync te behandelen.
+    if (buf[i] === CRSF_ADDR && i + 1 < buf.length && isCrsfSyncAddress(buf[i + 1]!)) {
+      i++;
+      continue;
+    }
+    if (!isCrsfSyncAddress(buf[i]!)) {
       i++;
       continue;
     }
     if (i + 2 > buf.length) break;
     const len = buf[i + 1]!;
     if (len < 2 || len > 62) {
-      i++;
       corrupt++;
+      reject({ reason: "bad-len", len, bytes: snippet(i, 8) });
+      i++;
       continue;
     }
     if (i + 2 + len > buf.length) break; // onvolledig
@@ -132,13 +176,14 @@ export function parseCrsfStream(buf: Uint8Array): CrsfParseResult {
     for (const b of payload) crc = crc8DvbS2(crc, b);
     if (crc !== wantCrc) {
       corrupt++;
+      reject({ reason: "bad-crc", type, len, bytes: snippet(i, Math.min(16, 2 + len)) });
       i++;
       continue;
     }
     frames.push({ type, payload });
     i += 2 + len;
   }
-  return { frames, rest: buf.slice(i), corrupt };
+  return { frames, rest: buf.slice(i), corrupt, bad };
 }
 
 export interface LinkStats {
@@ -151,10 +196,14 @@ export interface LinkStats {
 /** CRSF link-statistics (0x14), 10B payload. dBm = -value. */
 export function decodeLinkStats(payload: Uint8Array): LinkStats | null {
   if (payload.length < 10) return null;
+  // ELRS stuurt RSSI als signed int8 (0xD3 = -45 dBm); de TBS-spec noemt
+  // een magnitude (0x2D = -45 dBm). Beide komen voor, dus interpreteer
+  // hoge bytes als signed en lage bytes als magnitude.
+  const rssiDbm = (b: number): number => (b >= 0x80 ? b - 0x100 : -b);
   return {
-    uplinkRssiDbm: -payload[0]!,
+    uplinkRssiDbm: rssiDbm(payload[0]!),
     uplinkLq: payload[2]!,
-    downlinkRssiDbm: -payload[7]!,
+    downlinkRssiDbm: rssiDbm(payload[7]!),
     downlinkLq: payload[8]!,
   };
 }
@@ -252,16 +301,25 @@ export function encodeFromPc(cmd: FromPc): Uint8Array {
   return out;
 }
 
+export interface ToPcMessage {
+  msg: ToPc;
+  /** Exacte ruwe bytes van dit bericht (voor diagnose). */
+  raw: Uint8Array;
+}
+
 export interface PostcardParseResult {
-  messages: ToPc[];
+  messages: ToPcMessage[];
   rest: Uint8Array;
 }
 
 /** Streaming decoder voor ToPc over CDC (1 USB-pakket = 1 bericht, maar mag concateneren). */
 export function parseToPcStream(buf: Uint8Array): PostcardParseResult {
-  const messages: ToPc[] = [];
+  const messages: ToPcMessage[] = [];
+  const emit = (msg: ToPc, from: number, to: number) =>
+    messages.push({ msg, raw: buf.slice(from, to) });
   let offset = 0;
   while (offset < buf.length) {
+    const from = offset;
     let disc: { value: number; next: number } | null;
     try {
       disc = decodeVarint(buf, offset);
@@ -273,12 +331,16 @@ export function parseToPcStream(buf: Uint8Array): PostcardParseResult {
     if (variant === 0) {
       if (buf.length - next < 12) break;
       const dv = new DataView(buf.buffer, buf.byteOffset + next, 12);
-      messages.push({
-        kind: "attitude",
-        roll: dv.getFloat32(0, true),
-        pitch: dv.getFloat32(4, true),
-        yaw: dv.getFloat32(8, true),
-      });
+      emit(
+        {
+          kind: "attitude",
+          roll: dv.getFloat32(0, true),
+          pitch: dv.getFloat32(4, true),
+          yaw: dv.getFloat32(8, true),
+        },
+        from,
+        next + 12,
+      );
       offset = next + 12;
     } else if (variant === 1) {
       if (buf.length - next < 1) break;
@@ -287,23 +349,184 @@ export function parseToPcStream(buf: Uint8Array): PostcardParseResult {
       if (!a) break;
       const e = decodeVarint(buf, a.next);
       if (!e) break;
-      messages.push({ kind: "systemState", state, armBlocks: a.value, errors: e.value });
+      emit({ kind: "systemState", state, armBlocks: a.value, errors: e.value }, from, e.next);
       offset = e.next;
     } else if (variant === 2) {
-      messages.push({ kind: "ack" });
+      emit({ kind: "ack" }, from, next);
       offset = next;
     } else if (variant === 3) {
       const l = decodeVarint(buf, next);
       if (!l) break;
       if (buf.length - l.next < l.value) break;
       const bytes = buf.slice(l.next, l.next + l.value);
-      messages.push({ kind: "log", message: new TextDecoder().decode(bytes) });
+      emit({ kind: "log", message: new TextDecoder().decode(bytes) }, from, l.next + l.value);
       offset = l.next + l.value;
     } else {
       throw new Error(`unknown ToPc discriminant: ${variant}`);
     }
   }
   return { messages, rest: buf.slice(offset) };
+}
+
+// ---------------------------------------------------------------- ELRS-tuning over 0x7A/0x7B (contract met rust_fc/src/receiver/crsf.rs + tasks/tx.rs)
+// FC zendt antwoorden als CRSF-frame type 0x7B. Als extended frame:
+//   [dest][origin][sub-id (u16 LE)][data...]
+// Oudere FC-builds stuurden de sub-id direct na het type (zonder dest/origin);
+// decodeTelemetry7B accepteert tijdelijk beide vormen.
+// Ze komen via de ELRS-TX-module (USB) binnen, dus de backend leest ze op de TX-poort.
+//   0x7F03 ping-echo: sub-id + de ORIGINELE bytes (≤8B, seq+timestamp+random) ongewijzigd terug.
+//   0x7F04 TunAck:    sub-id + postcard-TunAck (spiegelt rust_fc/src/sync.rs).
+export const CRSF_TYPE_TELEMETRY = 0x7b;
+export const TUN_SUB_PING = 0x7f03;
+export const TUN_SUB_TUN_ACK = 0x7f04;
+/** Postcard-commando (SetPid/SetFilter) in een 0x7A-frame; spiegelt TuningCmd::Postcard. */
+export const TUN_SUB_POSTCARD = 0x7f00;
+
+export type TunAck =
+  | { kind: "pid"; axis: number; kp: number; ki: number; kd: number; ok: boolean }
+  | { kind: "filter"; gyro: number; lpf1: number; lpf2: number; ok: boolean };
+
+/** Decodeer postcard-TunAck: varint-discriminant (0=Pid, 1=Filter) + velden in declaratievolgorde. */
+export function decodeTunAckPayload(data: Uint8Array): TunAck {
+  const disc = decodeVarint(data, 0);
+  if (!disc) throw new Error("TunAck truncated (discriminant)");
+  const dv = new DataView(data.buffer, data.byteOffset + disc.next);
+  const rest = (n: number) => {
+    if (data.length - disc.next < n) throw new Error(`TunAck truncated (need ${n}B)`);
+  };
+  const f32 = (at: number) => dv.getFloat32(at, true);
+  if (disc.value === 0) {
+    rest(14);
+    return {
+      kind: "pid",
+      axis: dv.getUint8(0),
+      kp: f32(1),
+      ki: f32(5),
+      kd: f32(9),
+      ok: dv.getUint8(13) !== 0,
+    };
+  } else if (disc.value === 1) {
+    rest(13);
+    return {
+      kind: "filter",
+      gyro: f32(0),
+      lpf1: f32(4),
+      lpf2: f32(8),
+      ok: dv.getUint8(12) !== 0,
+    };
+  }
+  throw new Error(`unknown TunAck discriminant: ${disc.value}`);
+}
+
+export type Telemetry7B =
+  | { kind: "ping"; bytes: Uint8Array }
+  | { kind: "tunack"; ack: TunAck }
+  | { kind: "unknown"; sub: number };
+
+/** Splits een 0x7B-payload op sub-id. Gooit bij TunAck-decodefouten (corrupte inhoud).
+ *  0x7B is een extended frame: [dest][origin][sub-id lo][sub-id hi][data...].
+ *  Oudere FC-builds stuurden nog [sub-id...] zonder dest/origin; die blijven we
+ *  tijdens de overgang ook snappen. */
+export function decodeTelemetry7B(payload: Uint8Array): Telemetry7B | null {
+  const extended =
+    payload.length >= 4 && isCrsfDeviceAddress(payload[0]!) && isCrsfDeviceAddress(payload[1]!);
+  const body = extended ? payload.subarray(2) : payload;
+  if (body.length < 2) return null;
+  const sub = body[0]! | (body[1]! << 8);
+  if (sub === TUN_SUB_PING) return { kind: "ping", bytes: body.slice(2) };
+  if (sub === TUN_SUB_TUN_ACK) return { kind: "tunack", ack: decodeTunAckPayload(body.slice(2)) };
+  return { kind: "unknown", sub };
+}
+
+// ---------------------------------------------------------------- ELRS-tuning heartbeat (dashboard -> FC, via TX-module)
+// Ping-verzoek als CRSF extended frame (MSP_REQ-conventie, vgl. Betaflight-tx-lua:
+// dest=0xC8 wordt door de ELRS-TX-module naar de RX/FC doorgezet, orig=0xEA is de radio-kant):
+//   [0xC8][len][0x7A][0xC8][0xEA][0x03][0x7F][payload 8B][crc8-DVB-S2 over type..payload]
+// payload: seq u16LE + dashboard-tijd ms u32LE + random u16 (8B totaal, FC echoot alles terug).
+export const CRSF_TYPE_MSP_REQ = 0x7a;
+export const CRSF_ADDR_FC = 0xc8;
+// CRSF_ADDR_RADIO staat bovenaan gedefinieerd (0xEA).
+
+/** Wrap een extended-frame body (dest+origin+sub-id+data) in een 0x7A-frame. */
+function wrapCrsfExtendedRequest(body: Uint8Array): Uint8Array {
+  const frame = new Uint8Array(3 + body.length + 1);
+  frame[0] = CRSF_ADDR_FC; // sync-byte
+  frame[1] = 1 + body.length + 1; // type + body + crc
+  frame[2] = CRSF_TYPE_MSP_REQ;
+  frame.set(body, 3);
+  let crc = 0;
+  for (let i = 2; i < 3 + body.length; i++) crc = crc8DvbS2(crc, frame[i]!);
+  frame[3 + body.length] = crc;
+  return frame;
+}
+
+/** Postcard-encoding van rust_fc/src/receiver/crsf.rs::TuneMsg (variant-index + velden). */
+function encodeTuneMsg(cmd: FromPc): Uint8Array {
+  if (cmd.kind === "setPid") {
+    if (!Number.isInteger(cmd.axis) || cmd.axis < 0 || cmd.axis > 2) {
+      throw new Error(`axis must be 0..2, got ${cmd.axis}`);
+    }
+    const b = new Uint8Array(14);
+    b[0] = 0; // TuneMsg::SetPid
+    b[1] = cmd.axis;
+    const dv = new DataView(b.buffer);
+    dv.setFloat32(2, cmd.kp, true);
+    dv.setFloat32(6, cmd.ki, true);
+    dv.setFloat32(10, cmd.kd, true);
+    return b;
+  }
+  if (cmd.kind === "setFilter") {
+    const b = new Uint8Array(13);
+    b[0] = 1; // TuneMsg::SetFilter
+    const dv = new DataView(b.buffer);
+    dv.setFloat32(1, cmd.gyroCutoff, true);
+    dv.setFloat32(5, cmd.dtermCutoffLpf1, true);
+    dv.setFloat32(9, cmd.dtermCutoffLpf2, true);
+    return b;
+  }
+  throw new Error(`encodeTuneMsg: alleen setPid/setFilter, kreeg ${cmd.kind}`);
+}
+
+/** Live tuning via ELRS: SetPid/SetFilter als 0x7A extended frame (TuningCmd::Postcard). */
+export function encodeCrsfTune(cmd: FromPc): Uint8Array {
+  const data = encodeTuneMsg(cmd);
+  const body = new Uint8Array(4 + data.length);
+  body[0] = CRSF_ADDR_FC; // dest
+  body[1] = CRSF_ADDR_RADIO; // origin
+  body[2] = TUN_SUB_POSTCARD & 0xff;
+  body[3] = (TUN_SUB_POSTCARD >> 8) & 0xff;
+  body.set(data, 4);
+  return wrapCrsfExtendedRequest(body);
+}
+
+export function encodeTuningPing(seq: number, nowMs: number, rand: number): Uint8Array {
+  const payload = new Uint8Array(8);
+  const dv = new DataView(payload.buffer);
+  dv.setUint16(0, seq & 0xffff, true);
+  dv.setUint32(2, nowMs >>> 0, true);
+  dv.setUint16(6, rand & 0xffff, true);
+  const body = new Uint8Array([
+    CRSF_ADDR_FC,
+    CRSF_ADDR_RADIO,
+    TUN_SUB_PING & 0xff,
+    (TUN_SUB_PING >> 8) & 0xff,
+    ...payload,
+  ]);
+  return wrapCrsfExtendedRequest(body);
+}
+
+export interface PingEcho {
+  seq: number;
+  sentMs: number;
+  rand: number;
+}
+
+/** Lees seq/tijd/random uit een 0x7F03-echo (null bij <8B). */
+export function parsePingPayload(bytes: Uint8Array | number[]): PingEcho | null {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (b.length < 8) return null;
+  const dv = new DataView(b.buffer, b.byteOffset, 8);
+  return { seq: dv.getUint16(0, true), sentMs: dv.getUint32(2, true), rand: dv.getUint16(6, true) };
 }
 
 // ---------------------------------------------------------------- websocket-protocol (JSON)
@@ -318,7 +541,9 @@ export type PcToBackend =
       armed: boolean;
     }
   | { t: "fc"; cmd: FromPc }
-  | { t: "reconnect"; port: "tx" | "fc" };
+  | { t: "tune"; cmd: FromPc }
+  | { t: "reconnect"; port: "tx" | "fc" }
+  | { t: "setTxBaud"; baud: number };
 
 export type BackendToPc =
   | {
@@ -331,12 +556,16 @@ export type BackendToPc =
       fcSupported: boolean;
       txUpBytes: number;
       txDownBytes: number;
+      pingRttMs: number | null;
     }
   | { t: "channels"; ch: number[]; hz: number }
   | { t: "link"; stats: LinkStats }
   | { t: "attitude"; roll: number; pitch: number; yaw: number }
   | { t: "system"; state: number; stateName: string; armBlocks: number; errors: number }
   | { t: "ack" }
+  | { t: "tunack"; ack: TunAck }
+  | { t: "ping"; seq: number; bytes: number[]; rttMs: number | null }
+  | { t: "rx"; sight: RxSight }
   | { t: "log"; level: LogLevel; message: string }
   | { t: "banner"; port: "tx" | "fc" | "hid"; message: string };
 
@@ -348,5 +577,44 @@ export interface PortState {
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
+
+// ---------------------------------------------------------------- TX-baudrates (UI-keuze + backend)
+// Standaard 921600 (ELRS-TX-USB), alternatief 420000 — of een eigen waarde.
+export const TX_BAUD_PRESETS = [921600, 420000] as const;
+export const TX_BAUD_MIN = 1200;
+export const TX_BAUD_MAX = 2000000;
+
+export function isValidTxBaud(b: unknown): b is number {
+  return Number.isInteger(b) && (b as number) >= TX_BAUD_MIN && (b as number) <= TX_BAUD_MAX;
+}
+
+// ---------------------------------------------------------------- RX-inspector: alles wat terugkomt, ook fouten
+/** Eén waargenomen bericht op een seriële poort — geldig én afgekeurd. */
+export type RxSightKind =
+  | "link"
+  | "radio"
+  | "ping"
+  | "tunack"
+  | "fc"
+  | "other"
+  | "error";
+
+export interface RxSight {
+  port: "tx" | "fc";
+  /** Uniek, oplopend id — stabiele React-key en sortering. */
+  id: number;
+  /** Backend-tijd (epoch ms) van ontvangst. */
+  at: number;
+  /** false = afgekeurd/corrupt (CRC-fout, onbekende discriminant, te kort, …). */
+  ok: boolean;
+  /** Categorie voor het filter in de RX-inspector. */
+  kind: RxSightKind;
+  /** Korte samenvatting, bv. "0x7B sub 0x7F03 ping-echo" of "CRC-fout". */
+  label: string;
+  /** Ruwe bytes (gecapt, max 48B) — leeg als niet beschikbaar. */
+  bytes: number[];
+  /** Decodedetails of fouttekst. */
+  note?: string;
+}
 
 export * from "./xbox.js";

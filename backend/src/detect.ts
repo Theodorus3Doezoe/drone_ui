@@ -99,6 +99,10 @@ export async function resolveFcPort(req: string, quiet = false): Promise<string>
 /** Open kandidaat op 921600, stuur neutrale RC-frames, check op 0x3A-sync (alleen een TX doet dat). */
 async function probeTxCandidate(path: string): Promise<boolean> {
   const port = new SerialPort({ path, baudRate: 921600, autoOpen: false });
+  // Zonder error-listener crasht Node op elk serieel-foutje (unhandled 'error' event).
+  port.on("error", () => {
+    /* genegeerd — probe faalt zacht via found=false */
+  });
   try {
     await Promise.race([
       port.open(),
@@ -136,7 +140,7 @@ async function probeTxCandidate(path: string): Promise<boolean> {
   try {
     await port.close();
   } catch {
-    /* al dicht */
+    /* al dicht of nooit open geweest */
   }
   return found;
 }

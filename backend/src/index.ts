@@ -42,6 +42,18 @@ const opts = { ...cli, txPort, fcPort };
 
 const bridge = new Bridge(opts);
 const wss = new WebSocketServer({ port: opts.wsPort });
+// EADDRINUSE netjes melden i.p.v. een Node-stackdump: de frontend toont
+// zelf een verbindingsbanner met retry, dus hier volstaat een schone exit.
+wss.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(
+      `WS-poort ${opts.wsPort} is al in gebruik — draait er nog een bridge? Stop die eerst of start met --ws-port <vrij>.`,
+    );
+  } else {
+    console.error(`WebSocket-server fout: ${err.message}`);
+  }
+  process.exit(1);
+});
 attachWs(wss, bridge);
 
 // Controller voor headless gebruik. Xbox-pads zijn over USB meestal XInput

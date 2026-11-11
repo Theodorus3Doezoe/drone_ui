@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { FromPc } from "@ground-station/shared";
+import type { FromPc, TunAck } from "@ground-station/shared";
 
 const DEFAULTS = {
   roll: { kp: 0.0, ki: 0.0, kd: 0.0 },
@@ -10,87 +10,129 @@ const DEFAULTS = {
   dtermLpf2: 250,
 };
 
-export function Tuning(props: { fcSupported: boolean; sendFc: (cmd: FromPc) => void }) {
+type Axis = "roll" | "pitch" | "yaw";
+type Gain = "kp" | "ki" | "kd";
+
+export function Tuning(props: {
+  fcSupported: boolean;
+  sendFc: (cmd: FromPc) => void;
+  sendTune: (cmd: FromPc) => void;
+  lastAck?: TunAck | null;
+}) {
   const [pid, setPid] = useState(DEFAULTS);
   const [pending, setPending] = useState(false);
-  const disabled = !props.fcSupported && pending;
-  const hint = !props.fcSupported ? "FC ondersteunt dit nog niet (geen Ack ontvangen) — velden defensief grijs." : "";
+  const disabled = pending;
+  const hint = !props.fcSupported
+    ? "Nog geen TunAck (0x7F04) via ELRS — stuur een tuning; de FC bevestigt hieronder."
+    : "";
 
-  const set = (axis: "roll" | "pitch" | "yaw", k: "kp" | "ki" | "kd", v: number) =>
+  const set = (axis: Axis, k: Gain, v: number) =>
     setPid((p) => ({ ...p, [axis]: { ...p[axis], [k]: v } }));
 
   const sendAll = () => {
     (["roll", "pitch", "yaw"] as const).forEach((a, axis) => {
-      props.sendFc({ kind: "setPid", axis, kp: pid[a].kp, ki: pid[a].ki, kd: pid[a].kd });
+      props.sendTune({ kind: "setPid", axis, kp: pid[a].kp, ki: pid[a].ki, kd: pid[a].kd });
     });
-    props.sendFc({ kind: "setFilter", gyroCutoff: pid.gyro, dtermCutoffLpf1: pid.dtermLpf1, dtermCutoffLpf2: pid.dtermLpf2 });
+    props.sendTune({ kind: "setFilter", gyroCutoff: pid.gyro, dtermCutoffLpf1: pid.dtermLpf1, dtermCutoffLpf2: pid.dtermLpf2 });
     setPending(true);
     setTimeout(() => setPending(false), 1500);
   };
 
   return (
-    <div style={{ opacity: props.fcSupported ? 1 : 0.55 }}>
-      <p style={{ fontSize: 12, color: "#a00" }}>{hint}</p>
-      {(["roll", "pitch", "yaw"] as const).map((a) => (
-        <div key={a} style={{ marginBottom: 8 }}>
-          <strong>{a}</strong>
-          {(["kp", "ki", "kd"] as const).map((k) => (
-            <label key={k} style={{ marginLeft: 12, fontSize: 12 }}>
-              {k}
+    <div>
+      {hint && (
+        <p className="fc-hint" role="status">
+          {hint}
+        </p>
+      )}
+      {props.lastAck && (
+        <p className="mono" role="status" style={{ fontSize: 12, color: props.lastAck.ok ? "var(--ok)" : "var(--danger)" }}>
+          FC-bevestiging (0x7F04):{" "}
+          {props.lastAck.kind === "pid"
+            ? `Pid as${props.lastAck.axis} kp=${props.lastAck.kp} ki=${props.lastAck.ki} kd=${props.lastAck.kd}`
+            : `Filter gyro=${props.lastAck.gyro} lpf1=${props.lastAck.lpf1} lpf2=${props.lastAck.lpf2}`}{" "}
+          {props.lastAck.ok ? "— toegepast" : "— MISLUKT"}
+        </p>
+      )}
+      <div className="pid-grid">
+        {(["roll", "pitch", "yaw"] as const).map((a) => (
+          <div key={a} className="pid-card">
+            <h4>{a}</h4>
+            {(["kp", "ki", "kd"] as const).map((k) => (
+              <div key={k} className="pid-row">
+                <label htmlFor={`pid-${a}-${k}`}>{k}</label>
+                <input
+                  type="range"
+                  min={0}
+                  max={k === "kp" ? 2 : 1}
+                  step={0.001}
+                  value={pid[a][k]}
+                  disabled={disabled}
+                  onChange={(e) => set(a, k, Number(e.target.value))}
+                  aria-label={`${a} ${k} (schuif)`}
+                />
+                <input
+                  id={`pid-${a}-${k}`}
+                  type="number"
+                  step="0.001"
+                  min={0}
+                  value={pid[a][k]}
+                  disabled={disabled}
+                  onChange={(e) => set(a, k, Number(e.target.value))}
+                />
+              </div>
+            ))}
+          </div>
+        ))}
+        <div className="pid-card">
+          <h4>filters</h4>
+          {(
+            [
+              ["gyro", "gyro cutoff", 10, 500],
+              ["dtermLpf1", "dterm lpf1", 10, 500],
+              ["dtermLpf2", "dterm lpf2", 10, 500],
+            ] as const
+          ).map(([key, label, min, max]) => (
+            <div key={key} className="pid-row">
+              <label htmlFor={`flt-${key}`} title={label}>
+                {key === "gyro" ? "gy" : key === "dtermLpf1" ? "d1" : "d2"}
+              </label>
               <input
-                type="number"
-                step="0.001"
-                value={pid[a][k]}
+                type="range"
+                min={min}
+                max={max}
+                step={1}
+                value={pid[key]}
                 disabled={disabled}
-                onChange={(e) => set(a, k, Number(e.target.value))}
-                style={{ width: 80, marginLeft: 4 }}
+                onChange={(e) => setPid((p) => ({ ...p, [key]: Number(e.target.value) }))}
+                aria-label={`${label} (schuif)`}
               />
-            </label>
+              <input
+                id={`flt-${key}`}
+                type="number"
+                value={pid[key]}
+                disabled={disabled}
+                onChange={(e) => setPid((p) => ({ ...p, [key]: Number(e.target.value) }))}
+              />
+            </div>
           ))}
         </div>
-      ))}
-      <div style={{ marginBottom: 8, fontSize: 12 }}>
-        <label>
-          gyro cutoff
-          <input
-            type="number"
-            value={pid.gyro}
-            disabled={disabled}
-            onChange={(e) => setPid((p) => ({ ...p, gyro: Number(e.target.value) }))}
-            style={{ width: 70, marginLeft: 4 }}
-          />
-        </label>
-        <label style={{ marginLeft: 12 }}>
-          dterm lpf1
-          <input
-            type="number"
-            value={pid.dtermLpf1}
-            disabled={disabled}
-            onChange={(e) => setPid((p) => ({ ...p, dtermLpf1: Number(e.target.value) }))}
-            style={{ width: 70, marginLeft: 4 }}
-          />
-        </label>
-        <label style={{ marginLeft: 12 }}>
-          dterm lpf2
-          <input
-            type="number"
-            value={pid.dtermLpf2}
-            disabled={disabled}
-            onChange={(e) => setPid((p) => ({ ...p, dtermLpf2: Number(e.target.value) }))}
-            style={{ width: 70, marginLeft: 4 }}
-          />
-        </label>
       </div>
-      <button onClick={sendAll}>verstuur live</button>
-      <button onClick={() => setPid(DEFAULTS)} style={{ marginLeft: 8 }}>
-        reset naar default
-      </button>
-      <button onClick={() => props.sendFc({ kind: "arm" })} style={{ marginLeft: 8 }}>
-        arm
-      </button>
-      <button onClick={() => props.sendFc({ kind: "disarm" })} style={{ marginLeft: 8 }}>
-        disarm
-      </button>
+      <div className="tuning-actions" style={{ marginTop: 10 }}>
+        <button className="btn btn--primary btn--small" onClick={sendAll}>
+          Verstuur live
+        </button>
+        <button className="btn btn--small" onClick={() => setPid(DEFAULTS)}>
+          Reset
+        </button>
+        <span style={{ flex: 1 }} aria-hidden="true" />
+        <button className="btn btn--danger btn--small" onClick={() => props.sendFc({ kind: "arm" })}>
+          Arm
+        </button>
+        <button className="btn btn--small" onClick={() => props.sendFc({ kind: "disarm" })}>
+          Disarm
+        </button>
+      </div>
     </div>
   );
 }

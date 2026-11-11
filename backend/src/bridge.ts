@@ -7,11 +7,19 @@ import {
   CH_THROTTLE,
   CH_YAW,
   CRSF_MID,
+  CRSF_TYPE_TELEMETRY,
   LinkStats,
   LogLevel,
   PcToBackend,
   SYSTEM_STATE_NAMES,
   decodeLinkStats,
+  decodeTelemetry7B,
+  encodeCrsfTune,
+  encodeTuningPing,
+  isValidTxBaud,
+  TX_BAUD_MAX,
+  TX_BAUD_MIN,
+  parsePingPayload,
   encodeFromPc,
   encodeRcChannels,
   parseCrsfStream,
@@ -19,6 +27,7 @@ import {
   stickToCrsf,
   switchToCrsf,
   throttleToCrsf,
+  type RxSightKind,
 } from "@ground-station/shared";
 import { SerialPort } from "serialport";
 import { WebSocketServer, WebSocket } from "ws";
@@ -96,6 +105,15 @@ export class Bridge {
   private lastFcAttempt = 0;
   private lastTxWarn = 0;
   private lastFcWarn = 0;
+  // ELRS-tuning heartbeat: 1Hz ping via TX, echo komt terug als 0x7B/0x7F03.
+  private pingSeq = 0;
+  private lastPingSentAt = 0;
+  private pendingPing: { seq: number; at: number } | null = null;
+  private pingRttMs: number | null = null;
+  // Tuning via de ELRS-link: frames één voor één met kleine tussenruimte, zodat
+  // de ELRS-MSP-uplink (TX/RX) niet vier frames tegelijk hoeft te bufferen.
+  private tuneQueue: Uint8Array[] = [];
+  private tuneTimer: NodeJS.Timeout | null = null;
 
   constructor(private opts: BridgeOptions) {}
 
@@ -120,6 +138,41 @@ export class Bridge {
     this.broadcast({ t: "log", level, message });
   }
 
+  /** RX-inspector: één waarneming, gecapt (max 12 per data-event tegen WS-vloed). */
+  private rxBudget = 0;
+  /** Start bij epoch-ms zodat ids ook na een backend-restart oplopen. */
+  private rxSeq = Date.now();
+  private rxSight(
+    port: "tx" | "fc",
+    ok: boolean,
+    label: string,
+    bytes: Uint8Array | number[],
+    note?: string,
+    kind: RxSightKind = "other",
+  ): void {
+    if (this.rxBudget <= 0) return;
+    this.rxBudget--;
+    const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    this.broadcast({
+      t: "rx",
+      sight: {
+        port,
+        id: ++this.rxSeq,
+        at: Date.now(),
+        ok,
+        kind: ok ? kind : "error",
+        label,
+        bytes: [...b.slice(0, 48)],
+        ...(note !== undefined ? { note } : {}),
+      },
+    });
+  }
+
+  private hex(bytes: Uint8Array | number[]): string {
+    const b = bytes instanceof Uint8Array ? [...bytes] : bytes;
+    return b.map((x) => x.toString(16).padStart(2, "0")).join(" ");
+  }
+
   statusMessage(): BackendToPc {
     return {
       t: "status",
@@ -131,6 +184,7 @@ export class Bridge {
       fcSupported: this.fcSupported,
       txUpBytes: this.txUpBytes,
       txDownBytes: this.txDownBytes,
+      pingRttMs: this.pingRttMs,
     };
   }
 
@@ -243,9 +297,28 @@ export class Bridge {
       this.setInput(msg.roll, msg.pitch, msg.throttle, msg.yaw, msg.modeRate, msg.armed);
     } else if (msg.t === "fc") {
       this.sendFc(msg.cmd && (msg as { cmd: Parameters<typeof encodeFromPc>[0] }).cmd);
+    } else if (msg.t === "tune") {
+      this.sendTune((msg as { cmd: Parameters<typeof encodeCrsfTune>[0] }).cmd);
     } else if (msg.t === "reconnect") {
       this.reconnect(msg.port);
+    } else if (msg.t === "setTxBaud") {
+      this.setTxBaud((msg as { baud: unknown }).baud);
     }
+  }
+
+  /** TX-baud live omzetten: poort gaat dicht en opnieuw open op de nieuwe snelheid. */
+  setTxBaud(baud: unknown): void {
+    if (!isValidTxBaud(baud)) {
+      this.log("warn", `TX-baud genegeerd (ongeldig: ${String(baud)}, geldig ${TX_BAUD_MIN}..${TX_BAUD_MAX})`);
+      return;
+    }
+    if (baud === this.opts.txBaud && this.tx?.isOpen) {
+      this.log("info", `TX-baud al ${baud} — niets te doen`);
+      return;
+    }
+    this.opts.txBaud = baud;
+    this.log("info", `TX-baud -> ${baud}, poort opnieuw openen…`);
+    this.reconnect("tx");
   }
 
   setInput(roll: number, pitch: number, throttle: number, yaw: number, modeRate: boolean, armed: boolean): void {
@@ -299,6 +372,40 @@ export class Bridge {
     }
   }
 
+  /** Live tuning via de ELRS-link (0x7A extended frames), niet via FC-USB. */
+  sendTune(cmd: Parameters<typeof encodeCrsfTune>[0]): void {
+    if (!this.tx?.isOpen) {
+      this.log("warn", "TX-poort dicht, tuning genegeerd");
+      return;
+    }
+    try {
+      this.tuneQueue.push(encodeCrsfTune(cmd));
+      this.flushTuneQueue();
+    } catch (err) {
+      this.log("error", `tuning encode failed: ${(err as Error).message}`);
+    }
+  }
+
+  private flushTuneQueue(): void {
+    if (this.tuneTimer) return;
+    const step = (): void => {
+      const tx = this.tx;
+      if (!tx?.isOpen || this.tuneQueue.length === 0) {
+        this.tuneQueue.length = 0;
+        this.tuneTimer = null;
+        return;
+      }
+      const bytes = this.tuneQueue.shift()!;
+      tx.write(Buffer.from(bytes), (err) => {
+        if (err) this.log("error", `TX tuning write failed: ${err.message}`);
+      });
+      this.txUpBytes += bytes.length;
+      // ±25 Hz: snel genoeg voor de UI, rustig genoeg voor de ELRS-MSP-queue.
+      this.tuneTimer = setTimeout(step, 40);
+    };
+    step();
+  }
+
   private tick(): void {
     // Failsafe in twee trappen. Geen verse input (tab verborgen, pad weg):
     // blijf de LAATSTE input sturen zodat de link in leven blijft (net als een
@@ -307,7 +414,23 @@ export class Bridge {
     // De UI toont STALE zodra input ouder is dan 500ms.
     if (!this.hidOk) return;
     if (!this.tx?.isOpen) return;
-    const age = Date.now() - this.input.receivedAt;
+    // Heartbeat (1Hz) los van stick-input: bewijst de hele keten
+    // PC -> TX-module -> lucht -> RX -> FC -> terug, en levert RTT.
+    // Ping draagt geen besturing (FC echoot alleen), dus ook zonder verse input.
+    const nowMs = Date.now();
+    if (nowMs - this.lastPingSentAt >= 1000) {
+      this.lastPingSentAt = nowMs;
+      const seq = (this.pingSeq = (this.pingSeq + 1) & 0xffff);
+      try {
+        const frame = encodeTuningPing(seq, nowMs, Math.floor(Math.random() * 0x10000));
+        this.tx.write(Buffer.from(frame));
+        this.txUpBytes += frame.length;
+        this.pendingPing = { seq, at: nowMs };
+      } catch (err) {
+        this.log("warn", `ping encode failed: ${(err as Error).message}`);
+      }
+    }
+    const age = nowMs - this.input.receivedAt;
     if (!this.input.receivedAt || age > 5000) return; // geen verse input
 
     const ch = new Array(16).fill(CRSF_MID);
@@ -435,19 +558,86 @@ export class Bridge {
     this.txTextBuf = parts.pop() ?? "";
     for (const line of parts.slice(-5)) {
       const clean = line.replace(/\r/g, "").trim();
-      if (/^[\x20-\x7e]{3,200}$/.test(clean)) this.log("debug", `[TX] ${clean}`);
+      if (/^[\x20-\x7e]{3,200}$/.test(clean)) {
+        this.log("debug", `[TX] ${clean}`);
+        this.rxSight("tx", true, "usb-tekst", [], clean.slice(0, 120));
+      }
     }
     this.txRest = concat(this.txRest, data);
     try {
-      const { frames, rest, corrupt } = parseCrsfStream(this.txRest);
+      const { frames, rest, corrupt, bad } = parseCrsfStream(this.txRest);
       this.txRest = rest;
       this.corruptFrames += corrupt;
+      this.rxBudget = 12;
+      for (const b of bad) {
+        const what = b.reason === "bad-crc" ? "CRC-fout" : "lengte-fout";
+        const where = b.type !== undefined ? ` type 0x${b.type.toString(16)}` : "";
+        this.rxSight("tx", false, `${what}${where}`, b.bytes, `len=${b.len ?? "?"} bytes=${this.hex(b.bytes)}`);
+      }
       for (const f of frames) {
         if (f.type === 0x14) {
           const stats: LinkStats | null = decodeLinkStats(f.payload);
           if (stats) this.broadcast({ t: "link", stats });
+          this.rxSight(
+            "tx",
+            true,
+            "0x14 link-stats",
+            f.payload,
+            stats ? `up ${stats.uplinkRssiDbm}dBm/${stats.uplinkLq}% down ${stats.downlinkRssiDbm}dBm/${stats.downlinkLq}%` : "te kort (<10B)",
+            "link",
+          );
+        } else if (f.type === CRSF_TYPE_TELEMETRY) {
+          // 0x7B-antwoorden van de FC (via ELRS TX-USB): ping-echo (0x7F03) of TunAck (0x7F04).
+          try {
+            const tele = decodeTelemetry7B(f.payload);
+            if (!tele) {
+              this.log("warn", "0x7B-frame te kort (<2B, geen sub-id)");
+              this.rxSight("tx", false, "0x7B te kort", f.payload, "geen sub-id (<2B)");
+            } else if (tele.kind === "ping") {
+              const bytes = [...tele.bytes];
+              const echo = parsePingPayload(tele.bytes);
+              let rtt: number | null = null;
+              if (echo && this.pendingPing && echo.seq === this.pendingPing.seq) {
+                rtt = Date.now() - this.pendingPing.at;
+                this.pingRttMs = rtt;
+                this.pendingPing = null;
+              }
+              this.broadcast({ t: "ping", seq: echo?.seq ?? -1, bytes, rttMs: rtt });
+              this.rxSight("tx", true, "0x7B ping-echo", f.payload, `seq=${echo?.seq ?? "?"}${rtt !== null ? ` RTT ${rtt}ms` : " (geen match)"}`, "ping");
+            } else if (tele.kind === "tunack") {
+              this.lastAckAt = Date.now();
+              this.fcSupported = true;
+              this.broadcast({ t: "tunack", ack: tele.ack });
+              const a = tele.ack;
+              this.rxSight(
+                "tx",
+                true,
+                "0x7B TunAck",
+                f.payload,
+                a.kind === "pid"
+                  ? `pid as${a.axis} kp=${a.kp} ki=${a.ki} kd=${a.kd} ok=${a.ok}`
+                  : `filter gyro=${a.gyro} lpf1=${a.lpf1} lpf2=${a.lpf2} ok=${a.ok}`,
+                "tunack",
+              );
+            } else {
+              this.log("debug", `onbekende 0x7B-sub 0x${tele.sub.toString(16)} genegeerd`);
+              this.rxSight("tx", true, `0x7B sub 0x${tele.sub.toString(16)}`, f.payload, "onbekende sub, genegeerd");
+            }
+          } catch (err) {
+            this.log("warn", `TunAck gedropt: ${(err as Error).message}`);
+            this.rxSight("tx", false, "0x7B decode-fout", f.payload, (err as Error).message);
+          }
+        } else {
+          // 0x3A = ELRS handset-timing/radio-ID, normaal op RC-packetrate.
+          const radio = f.type === 0x3a;
+          const label = radio
+            ? "0x3A radio-ID/handset-timing"
+            : `0x${f.type.toString(16).padStart(2, "0")} overig`;
+          const note = radio
+            ? `${f.payload.length}B ELRS timing/offset (normaal, genegeerd)`
+            : `${f.payload.length}B genegeerd`;
+          this.rxSight("tx", true, label, f.payload, note, radio ? "radio" : "other");
         }
-        // overige telemetrie negeren
       }
     } catch {
       this.txRest = new Uint8Array(0);
@@ -457,10 +647,11 @@ export class Bridge {
 
   private onFcData(data: Uint8Array): void {
     this.fcRest = concat(this.fcRest, data);
+    this.rxBudget = 12;
     try {
       const { messages, rest } = parseToPcStream(this.fcRest);
       this.fcRest = rest;
-      for (const m of messages) {
+      for (const { msg: m, raw } of messages) {
         if (m.kind === "attitude") {
           // Decimeren naar ±20Hz voor de websocket.
           const now = Date.now();
@@ -468,6 +659,7 @@ export class Bridge {
             this.lastAttitudePush = now;
             this.broadcast({ t: "attitude", roll: m.roll, pitch: m.pitch, yaw: m.yaw });
           }
+          this.rxSight("fc", true, "postcard attitude", raw, `R=${m.roll.toFixed(3)} P=${m.pitch.toFixed(3)} Y=${m.yaw.toFixed(3)}`, "fc");
         } else if (m.kind === "systemState") {
           this.broadcast({
             t: "system",
@@ -476,16 +668,20 @@ export class Bridge {
             armBlocks: m.armBlocks,
             errors: m.errors,
           });
+          this.rxSight("fc", true, "postcard system", raw, `state=${m.state} armBlocks=${m.armBlocks} errors=${m.errors}`, "fc");
         } else if (m.kind === "ack") {
           this.lastAckAt = Date.now();
           this.fcSupported = true;
           this.broadcast({ t: "ack" });
+          this.rxSight("fc", true, "postcard ack", raw, "FC Ack (USB-CDC)", "fc");
         } else {
           this.broadcast({ t: "log", level: "info", message: `[FC] ${m.message}` });
+          this.rxSight("fc", true, "postcard log", raw, m.message.slice(0, 120), "fc");
         }
       }
     } catch (err) {
       this.corruptFrames += 1;
+      this.rxSight("fc", false, "postcard decode-fout", this.fcRest.slice(0, 48), (err as Error).message);
       this.fcRest = new Uint8Array(0);
       this.log("warn", `FC frame gedropt: ${(err as Error).message}`);
     }
